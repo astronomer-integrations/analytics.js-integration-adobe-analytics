@@ -1,20 +1,102 @@
 version: 2
 jobs:
-  setup:
+  build:
     docker:
-      - image: ${AWS_ACCOUNT_ID}.dkr.ecr.us-west-2.amazonaws.com/analytics.js-integrations-ci
+      - image: circleci/node:8-browsers
     steps:
       - run:
-          name: Checkout code
-          command: checkout
+          name: checkout
+          command: |
+            set -e
+
+            # Workaround old docker images with incorrect $HOME
+            # check https://github.com/docker/docker/issues/2968 for details
+            if [ "${HOME}" = "/" ]
+            then
+              export HOME=$(getent passwd $(id -un) | cut -d: -f6)
+            fi
+
+            mkdir -p ~/.ssh
+
+            echo 'github.com ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEAq2A7hRGmdnm9tUDbO9IDSwBK6TbQa+PXYPCPy6rbTrTtw7PHkccKrpp0yVhp5HdEIcKr6pLlVDBfOLX9QUsyCOV0wzfjIJNlGEYsdlLJizHhbn2mUjvSAHQqZETYP81eFzLQNnPHt4EVVUh7VfDESU84KezmD5QlWpXLmvU31/yMf+Se8xhHTvKSCZIFImWwoG6mbUoWf9nzpIoaSjB+weqqUUmpaaasXVal72J+UX2B+2RPW3RcT0eOzQgqlJL3RKrTJvdsjE3JEAvGq3lGHSZXy28G3skua2SmVi/w4yCE6gbODqnTWlg7+wC604ydGXA8VJiS5ap43JXiUFFAaQ==
+            bitbucket.org ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEAubiN81eDcafrgMeLzaFPsw2kNvEcqTKl/VqLat/MaB33pZy0y3rJZtnqwR2qOOvbwKZYKiEO1O6VqNEBxKvJJelCq0dTXWT5pbO2gDXC6h6QDXCaHo6pOHGPUy+YBaGQRGuSusMEASYiWunYN0vCAI8QaXnWMXNMdFP3jHAJH0eDsoiGnLPBlBp4TNm6rYI74nMzgz3B9IikW4WVK+dc8KZJZWYjAuORU3jc1c/NPskD2ASinf8v3xnfXeukU0sJ5N6m5E8VLjObPEO+mN2t/FZTMZLiFqPWc/ALSqnMnnhwrNi2rbfg/rd/IpL8Le3pSBne8+seeFVBoGqzHM9yXw==
+            ' >> ~/.ssh/known_hosts
+
+            (umask 077; touch ~/.ssh/id_rsa)
+            chmod 0600 ~/.ssh/id_rsa
+            (cat <<EOF > ~/.ssh/id_rsa
+            $CHECKOUT_KEY
+            EOF
+            )
+
+            # use git+ssh instead of https
+            git config --global url."ssh://git@github.com".insteadOf "https://github.com" || true
+
+            # MODIFICATIONS
+            if [ -n "$CIRCLE_TAG" ]
+            then
+              echo "Tags not supported"
+              exit 1
+            fi
+
+            if [ -e /home/circleci/project/.git ]
+            then
+              echo "Option not supported. You can't checkout from an cached repo"
+              exit 2
+            fi
+
+
+            mkdir -p /home/circleci/project
+            cd /home/circleci/project
+            git clone "$CIRCLE_REPOSITORY_URL" .
+            if [ "CIRCLE_BRANCH" == "master" ]
+            then
+              git fetch --force origin "master:remotes/origin/master"
+            fi
+
+            if [ -n "$CIRCLE_BRANCH" ]
+            then
+              git reset --hard "$CIRCLE_SHA1"
+              git checkout -q -B "$CIRCLE_BRANCH"
+            else
+              git fetch --force origin "${CIRCLE_BRANCH}/head:remotes/origin/${CIRCLE_BRANCH}"
+            fi
+
+            git reset --hard "$CIRCLE_SHA1"
+      - run:
+          name: Determine which projects have changed and trigger the builds
+          command: |
+            ## Identify head of master
+            git ls-remote origin | awk "/master/ {print \$1}" > master
+            MASTER_COMMIT=`cat master`
+
+            #Determine range of SHAs for diffing files
+            COMMITS="${CIRCLE_SHA1}..${MASTER_COMMIT}"
+
+            #Check the diff on the commits
+            git diff --name-only $COMMITS | cut -d/ -f1 | sort -u > projects
+            echo -e "Modified directories:\n`cat projects`\n"
+
+            # If modified directories contain yarn, buildkite, or circleci directories
+            buildall=0
+            for project in `cat projects`; do
+              if [[ ${project} =~ "yarn" || ${project} =~ ".buildkite" || ${project} =~ ".circleci" ]]; then
+                buildall=1
+                echo -e "Warning. Dependencies or internal configs have change detected."
+                exit 1
+              fi
+            done
       - restore_cache:
           key: deps-{{ checksum "yarn.lock" }}
       - run:
-          name: Authenticate npm
-          command: npm config set "//registry.npmjs.org/:_authToken" $NPM_AUTH
-      - run:
           name: Install
           command: yarn install --frozen-lockfile
+      - run:
+          name: Run Linter (not enforcing for now)
+          command: yarn lint
+      - run:
+          name: Run Tests
+          command: yarn test
       - save_cache:
           key: deps-{{ checksum "yarn.lock" }}
           paths:
@@ -23,104 +105,9 @@ jobs:
           root: .
           paths: [.]
 
-  test_phantomjs:
-    docker:
-      - image: ${AWS_ACCOUNT_ID}.dkr.ecr.us-west-2.amazonaws.com/analytics.js-integrations-ci
-    steps:
-      - attach_workspace: { at: . }
-      - restore_cache:
-          key: deps-{{ checksum "yarn.lock" }}
-      - run:
-          name: Test updated integrations in PhantomJS
-          command: yarn test-updated-integrations phantomjs
-      - run:
-          name: codecov
-          command: yarn coverage
-  test_saucelabs:
-    docker:
-      - image: ${AWS_ACCOUNT_ID}.dkr.ecr.us-west-2.amazonaws.com/analytics.js-integrations-ci
-    steps:
-      - attach_workspace: { at: . }
-      - restore_cache:
-          key: deps-{{ checksum "yarn.lock" }}
-      - run:
-          name: Tagging tunnel
-          command: |
-            SC_TUNNEL_ID="ajs-integrations-${CIRCLE_BUILD_NUM}"
-            echo "export SC_TUNNEL_ID=${SC_TUNNEL_ID}" >> ${BASH_ENV}
-            source ${BASH_ENV}
-      - run:
-          name: Start SauceConnect
-          command: sc -k $SAUCE_ACCESS_KEY -u $SAUCE_USERNAME -f ready.sc -d sc.pid -i ${SC_TUNNEL_ID}
-          background: true
-      - run:
-          name: Wait until it is ready
-          command: inotifywait --timeout 300 --exclude sc.pid --event create .
-      - run:
-          name: Test updated integrations in Chrome
-          command: yarn test-updated-integrations chrome
-      - run:
-          name: Test updated integrations in Firefox
-          command: yarn test-updated-integrations firefox
-      - run:
-          name: Test updated integrations in IE
-          command: yarn test-updated-integrations ie
-      - run:
-          name: Test updated integrations in Egde
-          command: yarn test-updated-integrations edge
-      - run:
-          name: Test updated integrations in Safari
-          command: yarn test-updated-integrations safari
-      - run:
-          name: Killing tunnel
-          command: kill $(cat sc.pid)
-
-  test_snyk:
-    docker:
-      - image: ${AWS_ACCOUNT_ID}.dkr.ecr.us-west-2.amazonaws.com/analytics.js-integrations-ci
-    steps:
-      - attach_workspace: { at: . }
-      - restore_cache:
-          key: deps-{{ checksum "yarn.lock" }}
-      - run:
-          name: Snyk Setup
-          command: curl -sL https://raw.githubusercontent.com/segmentio/snyk_helpers/master/initialization/snyk.sh | sh
-
-  publish:
-    docker:
-      - image: ${AWS_ACCOUNT_ID}.dkr.ecr.us-west-2.amazonaws.com/analytics.js-integrations-ci
-    steps:
-      - attach_workspace: { at: . }
-      - restore_cache:
-          key: deps-{{ checksum "yarn.lock" }}
-      - run:
-          name: Authenticate npm
-          command: npm config set "//registry.npmjs.org/:_authToken" $NPM_AUTH
-      - run:
-          name: Publish updated packages
-          command: yarn publish-integrations
 
 workflows:
   version: 2
-  test_and_publish:
+  test:
     jobs:
-      - setup:
-          context: segmentio-org-global
-      - test_phantomjs:
-          requires:
-            - setup
-      - test_saucelabs:
-          requires:
-            - setup
-      - test_snyk:
-          context: snyk
-          requires:
-            - setup
-      - publish:
-          context: segmentio-org-global
-          requires:
-            - test_phantomjs
-            - test_saucelabs
-          filters:
-            branches:
-              only: master
+      - build

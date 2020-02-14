@@ -3,10 +3,10 @@
 
 Adobe Analytics integration for [Analytics.js][].
 
-## License
+## Introduction
+This repo stores the majority of the `analytics.js` integrations that Segment currently supports. It is organized as a monorepo with each individual integration packaged and deployed as their own npm modules.
 
-Released under the [MIT license](LICENSE).
-
+## Getting Started
+To start contributing, please ensure you have the following installed on your local machine:
 
 [Analytics.js]: https://segment.com/docs/libraries/analytics.js/
-

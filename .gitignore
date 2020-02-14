@@ -1,1 +1,7 @@
-node_modules
+bin/
+node_modules/
+coverage/
+*.log
+package-lock.json
+*.xml
+yarn-error.log
